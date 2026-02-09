@@ -3,6 +3,10 @@ LEAN predictive prosthetic
 
 **Heterogeneous TTC Model with MLA (No Routing – All Experts Active Every Loop)**
 
+**Architecture**
+* AI model purpose built for LEAN
+* Vector DB pre-populated with LEAN proofs & tactics
+
 ## Overall Purpose
 - Combine three architecturally diverse experts (Transformer, Diffusion, SSM)
 - Use **test-time compute (TTC)** via iterative refinement loops
