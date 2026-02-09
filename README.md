@@ -15,13 +15,16 @@ LEAN predictive prosthetic
 - Use **test-time compute (TTC)** via iterative refinement loops
 - Fuse expert outputs using **Multi-head Latent Attention (MLA)** with **RoPE** for efficient, position-aware cross-expert communication
 - No routing: every expert processes the current latent state in **every** loop iteration
+- Predict next tactic via **contrastive retrieval** against a tactic embedding index
 
 ## Model Components
 
-### 1. Input Embedding
-- `self.embed`: Linear(dim_in → dim)
-- Projects raw input → fixed latent dimension
-- Shape transformation: `[batch, input_features]` → `[batch, dim]`
+### 1. Lean State Encoder
+- `self.encoder`: `LeanStateEncoder` — frozen CodeBERT backbone + learned linear projection
+- Backbone: `microsoft/codebert-base` (125M params, frozen)
+- Projection: Linear(768 → dim) — only learnable part (~197K params)
+- Input: tokenized Lean proof state `(input_ids, attention_mask)`
+- Output: `[batch, dim]`
 
 ### 2. Experts (run in parallel every loop)
 | Expert              | Architecture Type      | Key Operation                              | Output Shape    | Role / Strength                          |
@@ -59,28 +62,54 @@ LEAN predictive prosthetic
 ```
 fused = final_agg(mean(mla_output, dim=1))
 x_new = fused + x          # residual connection
-text- Enables progressive refinement of the latent state across loops
 ```
+- Enables progressive refinement of the latent state across loops
 
 ### 5. Test-Time Compute (TTC) Loop
 - Controlled by `num_loops` (hyperparameter, e.g. 4–16)
 - Pseudocode flow per forward pass:
 ```
-x ← embed(input)
+x ← encoder(proof_state)
 for i in 1 to num_loops:
-e1 ← transformer_expert(x)
-e2 ← diffusion_expert(x)
-e3 ← ssm_expert(x)
-expert_views ← stack([e1, e2, e3], dim=1)          # [B, 3, dim]
-attended     ← mla(expert_views)                    # [B, 3, dim] with RoPE applied internally
-fused        ← mean(attended, dim=1)                # [B, dim]
-x            ← final_agg(fused) + x                 # residual
-return x
+    e1 ← transformer_expert(x)
+    e2 ← diffusion_expert(x)
+    e3 ← ssm_expert(x)
+    expert_views ← stack([e1, e2, e3], dim=1)          # [B, 3, dim]
+    attended     ← mla(expert_views)                    # [B, 3, dim] with RoPE applied internally
+    fused        ← mean(attended, dim=1)                # [B, dim]
+    x            ← final_agg(fused) + x                 # residual
+emb, logits, conf ← head(x)
+return emb, logits, conf
 ```
+
+### 6. Output Head (`TacticHead`)
+- **Retrieval projection**: MLP → L2-normalize → `[batch, dim]` embedding for FAISS nearest-neighbor lookup against pre-embedded tactics
+- **Coarse classifier**: Linear(dim → C) over ~64 tactic families (simp, ring, apply, intro, etc.) — provides auxiliary gradients during training
+- **Confidence scorer**: Linear(dim → 1) + sigmoid — predicts whether the model's top retrieval is correct, enables adaptive TTC (run more loops when confidence is low)
+
+## Training
+
+### Objective
+Combined loss: `L = L_contrastive + 0.3 * L_classifier + 0.1 * L_confidence`
+
+| Loss | Type | Purpose |
+|------|------|---------|
+| `L_contrastive` | InfoNCE (temperature=0.07) | Pull retrieval embedding toward correct tactic, push away from in-batch negatives |
+| `L_classifier` | Cross-entropy | Coarse tactic family prediction — clean gradients early in training |
+| `L_confidence` | Binary cross-entropy | Train confidence to predict retrieval correctness |
+
+### Why contrastive + TTC?
+The iterative refinement loop progressively pushes the latent toward the correct tactic embedding. Contrastive loss directly rewards this — the latent should be closer to the correct tactic than to any other tactic in the batch. More loops = better alignment.
+
+### Data
+- Source: LeanDojo (proof_state, tactic) pairs
+- Tactic embeddings: produced by the same frozen encoder, stored in a FAISS index
+- Coarse labels: ~64 tactic families derived from tactic name prefixes
 
 ## Key Design Properties
 - **Heterogeneity**: Three different inductive biases active simultaneously
 - **No routing overhead**: All experts always compute (trade compute for diversity)
 - **Efficient attention with position awareness**: MLA compresses KV (low memory); RoPE adds relative positioning without extra parameters or KV cache bloat
 - **Iterative refinement**: TTC loop allows error correction & progressive improvement
+- **Retrieval-based prediction**: Open-ended tactic space handled via embedding similarity, not fixed classification
 - **Modular & extensible**: Easy to swap/replace experts or extend RoPE to longer sequences
